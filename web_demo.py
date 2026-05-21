@@ -1,10 +1,24 @@
 import io
 import os
+import sys
 import torch
 
 os.environ['VLLM_USE_V1'] = '0'
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 from argparse import ArgumentParser
+
+# Voice-cloning helpers from the model-training repo. Required: predict() uses
+# generate_audio_talker_direct() (via the splice path) instead of the noisy
+# integrated model.generate() Talker.
+_scripts_path = os.path.expanduser("~/repos/internal_repos/model-training/scripts")
+if _scripts_path not in sys.path:
+    sys.path.insert(0, _scripts_path)
+from inference_tts import (  # noqa: E402
+    _load_speaker_embedding,
+    build_spliced_embeds as _build_spliced_embeds,
+    generate_audio_talker_direct as _generate_audio_talker_direct,
+)
+from train_talker import DEFAULT_USER_INSTRUCTION as _DEFAULT_USER_INSTRUCTION  # noqa: E402
 
 import gradio as gr
 import gradio.processing_utils as processing_utils
@@ -17,17 +31,37 @@ from transformers import Qwen3OmniMoeProcessor
 
 
 def _load_model_processor(args):
-    # Check if flash-attn2 flag is enabled and load model accordingly
-    # THIS FUNCTION IS UNCHANGED
     if args.use_transformers:
+        import json, torch as _torch
         from transformers import Qwen3OmniMoeForConditionalGeneration
-        if args.flash_attn2:
-            model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(args.checkpoint_path,
-                                                                        dtype='auto',
-                                                                        attn_implementation='flash_attention_2',
-                                                                        device_map="auto")
-        else:
-            model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(args.checkpoint_path, device_map="auto", dtype='auto')
+        attn = 'flash_attention_2' if args.flash_attn2 else 'sdpa'
+
+        # Dispatch on checkpoint_info.json written by scripts/train_talker.py:
+        #   checkpoint_type == "talker_only"      -> self-contained 15-shard checkpoint
+        #       with trained Talker overlaid; load directly from args.checkpoint_path.
+        #       Processor files may not be present; fall back to base_model_path.
+        #   checkpoint_type == "full_safetensors" -> deprecated alias, same handling.
+        #   (no checkpoint_info.json)             -> pristine HF checkpoint.
+        _ckpt_info_path = os.path.join(args.checkpoint_path, "checkpoint_info.json")
+        _processor_path = args.checkpoint_path
+        _ckpt_type = None
+        _ckpt_info = None
+        if os.path.exists(_ckpt_info_path):
+            with open(_ckpt_info_path) as _f:
+                _ckpt_info = json.load(_f)
+            _ckpt_type = _ckpt_info.get("checkpoint_type")
+
+        if _ckpt_type in ("talker_only", "full_safetensors"):
+            print(f"Talker-only checkpoint detected. Loading from {args.checkpoint_path} ...")
+            # Processor files are not stored in talker-only checkpoints;
+            # fall back to base_model_path for tokenizer / preprocessor.
+            if _ckpt_info and "base_model_path" in _ckpt_info:
+                _base_path = os.path.expanduser(_ckpt_info["base_model_path"])
+                if os.path.exists(os.path.join(_base_path, "preprocessor_config.json")):
+                    _processor_path = _base_path
+
+        model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+            args.checkpoint_path, device_map="cuda:0", dtype='auto', attn_implementation=attn)
     else:
         from vllm import LLM
         model = LLM(
@@ -39,7 +73,20 @@ def _load_model_processor(args):
             seed=1234,
         )
 
-    processor = Qwen3OmniMoeProcessor.from_pretrained(args.checkpoint_path)
+    _final_processor_path = args.processor_path if args.processor_path else _processor_path
+    # For full-model checkpoints saved without processor files, read the base
+    # path from config.json's _name_or_path field as a last resort.
+    if not os.path.exists(os.path.join(_final_processor_path, "preprocessor_config.json")):
+        import json as _json
+        _cfg = os.path.join(_final_processor_path, "config.json")
+        if os.path.exists(_cfg):
+            with open(_cfg) as _f:
+                _name_or_path = _json.load(_f).get("_name_or_path", "")
+            if _name_or_path and os.path.isdir(_name_or_path) and \
+                    os.path.exists(os.path.join(_name_or_path, "preprocessor_config.json")):
+                print(f"preprocessor_config.json not found in checkpoint; falling back to {_name_or_path}")
+                _final_processor_path = _name_or_path
+    processor = Qwen3OmniMoeProcessor.from_pretrained(_final_processor_path)
     return model, processor
 
 def _launch_demo(args, model, processor):
@@ -185,19 +232,59 @@ def _launch_demo(args, model, processor):
             audios, images, videos = process_mm_info(messages, use_audio_in_video=True)
             inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=True)
             inputs = inputs.to(model.device).to(model.dtype)
-            text_ids, audio = model.generate(**inputs, 
-                                             thinker_return_dict_in_generate=True,
-                                             thinker_max_new_tokens=32768, 
-                                             thinker_do_sample=True, 
-                                             thinker_temperature=temperature, 
-                                             thinker_top_p=top_p, 
-                                             thinker_top_k=top_k, 
-                                             speaker=voice_choice, 
-                                             use_audio_in_video=True)
-            response = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1] :], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+            use_voice_clone = _speaker_embedding is not None
+            text_ids, _builtin_audio = model.generate(
+                **inputs,
+                thinker_return_dict_in_generate=True,
+                thinker_max_new_tokens=512,
+                thinker_do_sample=True,
+                thinker_temperature=temperature,
+                thinker_top_p=top_p,
+                thinker_top_k=top_k,
+                speaker=voice_choice,
+                use_audio_in_video=True,
+                return_audio=not use_voice_clone,  # skip built-in Talker when voice-cloning
+            )
+            reply_ids = text_ids.sequences[:, inputs["input_ids"].shape[1]:]
+            response = processor.batch_decode(reply_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
             yield {"type": "text", "data": response}
-            if audio is not None:
-                audio = np.array(audio.reshape(-1).float().detach().cpu().numpy() * 32767).astype(np.int16)
+
+            if use_voice_clone:
+                # Two-step splice path: hand the Thinker's raw reply token IDs to
+                # build_spliced_embeds(), which assembles the Talker's ChatML user+asst
+                # embeddings without a text decode/re-encode round-trip. Then call
+                # generate_audio_talker_direct() with those precomputed embeds — it applies
+                # proper EOS handling, suppress_tokens, and repetition_penalty, producing
+                # cleaner audio than the integrated model.generate() Talker.
+                user_embeds, asst_embeds = _build_spliced_embeds(
+                    model, processor.tokenizer, reply_ids[0],
+                    user_instruction=_DEFAULT_USER_INSTRUCTION,
+                )
+                audio_wav = _generate_audio_talker_direct(
+                    model,
+                    processor.tokenizer,
+                    response,
+                    speaker=voice_choice,
+                    speaker_embedding=_speaker_embedding,
+                    user_instruction=_DEFAULT_USER_INSTRUCTION,
+                    max_new_tokens=2048,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=1.05,
+                    max_text_length=512,
+                    precomputed_user_embeds=user_embeds,
+                    precomputed_asst_embeds=asst_embeds,
+                )
+                if audio_wav is not None:
+                    audio_np = np.array(audio_wav.reshape(-1).float().detach().cpu().numpy() * 32767).astype(np.int16)
+                    wav_io = io.BytesIO()
+                    sf.write(wav_io, audio_np, samplerate=24000, format="WAV")
+                    audio_path = processing_utils.save_bytes_to_cache(wav_io.getvalue(), "audio.wav", cache_dir=demo.GRADIO_CACHE)
+                    yield {"type": "audio", "data": audio_path}
+            elif _builtin_audio is not None:
+                audio = np.array(_builtin_audio.reshape(-1).float().detach().cpu().numpy() * 32767).astype(np.int16)
                 wav_io = io.BytesIO()
                 sf.write(wav_io, audio, samplerate=24000, format="WAV")
                 wav_bytes = wav_io.getvalue()
@@ -338,7 +425,6 @@ def _launch_demo(args, model, processor):
 DEFAULT_CKPT_PATH = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 def _get_args():
-    # THIS FUNCTION IS UNCHANGED
     parser = ArgumentParser()
 
     parser.add_argument('-c',
@@ -346,6 +432,12 @@ def _get_args():
                         type=str,
                         default=DEFAULT_CKPT_PATH,
                         help='Checkpoint name or path, default to %(default)r')
+    parser.add_argument('--processor-path',
+                        type=str,
+                        default=None,
+                        help='Path to load the processor from. Defaults to --checkpoint-path. '
+                             'Needed when the checkpoint directory lacks processor files '
+                             '(e.g. full model saved without processor, or talker-only checkpoint).')
     parser.add_argument('--generate-audio',
                         action='store_true',
                         default=False,
@@ -368,6 +460,17 @@ def _get_args():
                         help='Automatically launch the interface in a new tab on the default browser.')
     parser.add_argument('--server-port', type=int, default=8901, help='Demo server port.')
     parser.add_argument('--server-name', type=str, default='127.0.0.1', help='Demo server name.')
+    parser.add_argument(
+        '--ref-audio',
+        type=str,
+        default=None,
+        help=(
+            'Path to a reference WAV file for voice cloning. '
+            'Extracts a speaker embedding and uses generate_audio_talker_direct() '
+            'instead of the built-in model.generate() Talker, which produces cleaner audio. '
+            'Requires the model-training scripts to be reachable.'
+        ),
+    )
 
     args = parser.parse_args()
     return args
@@ -375,4 +478,13 @@ def _get_args():
 if __name__ == "__main__":
     args = _get_args()
     model, processor = _load_model_processor(args)
+
+    _speaker_embedding = None
+    if args.ref_audio:
+        print(f"Extracting speaker embedding from {args.ref_audio} ...")
+        _speaker_embedding = _load_speaker_embedding(
+            os.path.expanduser(args.ref_audio), device="cuda:0"
+        )
+        print(f"  Speaker embedding ready: {_speaker_embedding.shape}")
+
     _launch_demo(args, model, processor)
