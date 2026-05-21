@@ -97,6 +97,10 @@ def _launch_demo(args, model, processor):
     default_system_prompt = ''
     use_transformers = args.use_transformers
     generate_audio = args.generate_audio
+    # When True: talker input uses only layer0 (token embeddings, matching training).
+    # When False: model.generate() runs the integrated talker which uses layer24
+    #             (thinker hidden states) for audio token positions.
+    talker_layer0_only = args.layer0_only
     if not use_transformers:
         if generate_audio:
             print("Generating audio is not supported with vLLM. Please use the 'python web_demo.py --use-transformers --generate-audio --flash-attn2' instead.")
@@ -233,30 +237,27 @@ def _launch_demo(args, model, processor):
             inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=True)
             inputs = inputs.to(model.device).to(model.dtype)
 
-            use_voice_clone = _speaker_embedding is not None
-            text_ids, _builtin_audio = model.generate(
-                **inputs,
-                thinker_return_dict_in_generate=True,
-                thinker_max_new_tokens=512,
-                thinker_do_sample=True,
-                thinker_temperature=temperature,
-                thinker_top_p=top_p,
-                thinker_top_k=top_k,
-                speaker=voice_choice,
-                use_audio_in_video=True,
-                return_audio=not use_voice_clone,  # skip built-in Talker when voice-cloning
-            )
-            reply_ids = text_ids.sequences[:, inputs["input_ids"].shape[1]:]
-            response = processor.batch_decode(reply_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-            yield {"type": "text", "data": response}
+            if talker_layer0_only:
+                # Layer0-only path: thinker generates text, then the talker is driven
+                # via build_spliced_embeds() + generate_audio_talker_direct(), which
+                # uses only layer0 (token embeddings) for all talker input positions.
+                # This matches the training procedure and avoids the layer24 mismatch.
+                text_ids, _ = model.generate(
+                    **inputs,
+                    thinker_return_dict_in_generate=True,
+                    thinker_max_new_tokens=32768,
+                    thinker_do_sample=True,
+                    thinker_temperature=temperature,
+                    thinker_top_p=top_p,
+                    thinker_top_k=top_k,
+                    speaker=voice_choice,
+                    use_audio_in_video=True,
+                    return_audio=False,
+                )
+                reply_ids = text_ids.sequences[:, inputs["input_ids"].shape[1]:]
+                response = processor.batch_decode(reply_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+                yield {"type": "text", "data": response}
 
-            if use_voice_clone:
-                # Two-step splice path: hand the Thinker's raw reply token IDs to
-                # build_spliced_embeds(), which assembles the Talker's ChatML user+asst
-                # embeddings without a text decode/re-encode round-trip. Then call
-                # generate_audio_talker_direct() with those precomputed embeds — it applies
-                # proper EOS handling, suppress_tokens, and repetition_penalty, producing
-                # cleaner audio than the integrated model.generate() Talker.
                 user_embeds, asst_embeds = _build_spliced_embeds(
                     model, processor.tokenizer, reply_ids[0],
                     user_instruction=_DEFAULT_USER_INSTRUCTION,
@@ -266,7 +267,7 @@ def _launch_demo(args, model, processor):
                     processor.tokenizer,
                     response,
                     speaker=voice_choice,
-                    speaker_embedding=_speaker_embedding,
+                    speaker_embedding=_speaker_embedding,  # None unless --ref-audio given
                     user_instruction=_DEFAULT_USER_INSTRUCTION,
                     max_new_tokens=2048,
                     temperature=temperature,
@@ -274,8 +275,6 @@ def _launch_demo(args, model, processor):
                     top_p=top_p,
                     repetition_penalty=1.05,
                     max_text_length=512,
-                    precomputed_user_embeds=user_embeds,
-                    precomputed_asst_embeds=asst_embeds,
                 )
                 if audio_wav is not None:
                     audio_np = np.array(audio_wav.reshape(-1).float().detach().cpu().numpy() * 32767).astype(np.int16)
@@ -283,13 +282,29 @@ def _launch_demo(args, model, processor):
                     sf.write(wav_io, audio_np, samplerate=24000, format="WAV")
                     audio_path = processing_utils.save_bytes_to_cache(wav_io.getvalue(), "audio.wav", cache_dir=demo.GRADIO_CACHE)
                     yield {"type": "audio", "data": audio_path}
-            elif _builtin_audio is not None:
-                audio = np.array(_builtin_audio.reshape(-1).float().detach().cpu().numpy() * 32767).astype(np.int16)
-                wav_io = io.BytesIO()
-                sf.write(wav_io, audio, samplerate=24000, format="WAV")
-                wav_bytes = wav_io.getvalue()
-                audio_path = processing_utils.save_bytes_to_cache(wav_bytes, "audio.wav", cache_dir=demo.GRADIO_CACHE)
-                yield {"type": "audio", "data": audio_path}
+            else:
+                # Original path: integrated model.generate() runs both thinker and
+                # talker together. Audio token positions in the user segment receive
+                # layer24 (thinker hidden states via hidden_projection).
+                text_ids, audio = model.generate(
+                    **inputs,
+                    thinker_return_dict_in_generate=True,
+                    thinker_max_new_tokens=32768,
+                    thinker_do_sample=True,
+                    thinker_temperature=temperature,
+                    thinker_top_p=top_p,
+                    thinker_top_k=top_k,
+                    speaker=voice_choice,
+                    use_audio_in_video=True,
+                )
+                response = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+                yield {"type": "text", "data": response}
+                if audio is not None:
+                    audio = np.array(audio.reshape(-1).float().detach().cpu().numpy() * 32767).astype(np.int16)
+                    wav_io = io.BytesIO()
+                    sf.write(wav_io, audio, samplerate=24000, format="WAV")
+                    audio_path = processing_utils.save_bytes_to_cache(wav_io.getvalue(), "audio.wav", cache_dir=demo.GRADIO_CACHE)
+                    yield {"type": "audio", "data": audio_path}
         else:
             sampling_params = SamplingParams(temperature=temperature, top_p=top_p, top_k=top_k, max_tokens=16384)
             text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -469,6 +484,17 @@ def _get_args():
             'Extracts a speaker embedding and uses generate_audio_talker_direct() '
             'instead of the built-in model.generate() Talker, which produces cleaner audio. '
             'Requires the model-training scripts to be reachable.'
+        ),
+    )
+    parser.add_argument(
+        '--layer0-only',
+        action='store_true',
+        default=False,
+        help=(
+            'Use only layer0 (token embeddings) for all talker input positions. '
+            'Matches training (no layer24 / hidden_projection for audio tokens). '
+            'When omitted, the integrated model.generate() talker runs with layer24 '
+            'for audio token positions (original behaviour).'
         ),
     )
 
