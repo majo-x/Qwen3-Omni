@@ -258,9 +258,25 @@ def _launch_demo(args, model, processor):
                 response = processor.batch_decode(reply_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
                 yield {"type": "text", "data": response}
 
+                # Extract the last typed user message for Step 1 conversational format.
+                # For audio (mic) input there is no text, so user_text stays None
+                # and build_spliced_embeds falls back to the TTS format.
+                _last_user_text = None
+                for _msg in reversed(messages):
+                    if _msg.get("role") == "user":
+                        _content = _msg.get("content", [])
+                        if isinstance(_content, list):
+                            _texts = [c["text"] for c in _content if isinstance(c, dict) and c.get("type") == "text"]
+                            if _texts:
+                                _last_user_text = " ".join(_texts)
+                        elif isinstance(_content, str):
+                            _last_user_text = _content
+                        break
+
                 user_embeds, asst_embeds = _build_spliced_embeds(
                     model, processor.tokenizer, reply_ids[0],
                     user_instruction=_DEFAULT_USER_INSTRUCTION,
+                    user_text=_last_user_text,
                 )
                 audio_wav = _generate_audio_talker_direct(
                     model,
