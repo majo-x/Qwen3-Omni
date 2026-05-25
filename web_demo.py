@@ -89,6 +89,49 @@ def _load_model_processor(args):
     processor = Qwen3OmniMoeProcessor.from_pretrained(_final_processor_path)
     return model, processor
 
+
+def _extract_last_user_ids(
+    input_ids: "torch.Tensor", tokenizer
+) -> "torch.Tensor | None":
+    """Return a [1, L] tensor with the last user turn from the Thinker's input_ids.
+
+    The slice spans <|im_start|>user\\n ... <|im_end|>\\n and may contain audio
+    placeholder tokens inserted by the processor.  When passed to
+    build_spliced_embeds as *user_ids*, every token (including audio placeholders)
+    is embedded via the layer-0 embedding table — the tp(e_aud) path for Step 2.
+
+    Returns None if no user turn is found (should not happen in normal usage).
+    """
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+
+    user_header_ids = tokenizer(
+        "<|im_start|>user\n", return_tensors="pt", add_special_tokens=False
+    ).input_ids[0].tolist()
+    header_len = len(user_header_ids)
+
+    ids = input_ids[0].tolist()
+    n = len(ids)
+
+    # The last <|im_start|> belongs to the generation prompt (<|im_start|>assistant\n).
+    # Everything from the previous user-header up to that point is the last user turn,
+    # including the trailing \n after <|im_end|>.
+    im_start_positions = [i for i, tok in enumerate(ids) if tok == im_start_id]
+    if len(im_start_positions) < 2:
+        return None
+    gen_prompt_start = im_start_positions[-1]
+
+    last_user_start = None
+    for i in range(gen_prompt_start - header_len, -1, -1):
+        if ids[i : i + header_len] == user_header_ids:
+            last_user_start = i
+            break
+
+    if last_user_start is None:
+        return None
+
+    return input_ids[0, last_user_start:gen_prompt_start].unsqueeze(0)
+
+
 def _launch_demo(args, model, processor):
     # --- Start of Function: UNCHANGED settings ---
     # Voice settings
@@ -258,25 +301,39 @@ def _launch_demo(args, model, processor):
                 response = processor.batch_decode(reply_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
                 yield {"type": "text", "data": response}
 
-                # Extract the last typed user message for Step 1 conversational format.
-                # For audio (mic) input there is no text, so user_text stays None
-                # and build_spliced_embeds falls back to the TTS format.
+                # Build the talker's user segment.
+                #
+                # Step 2: extract the last user turn directly from inputs["input_ids"].
+                #   This tensor may contain audio placeholder tokens (mic input), so
+                #   the talker sees tp(e_aud) — their layer-0 embeddings — for each
+                #   audio position.  For text-only input the result is equivalent to
+                #   Step 1 (same tokens, same layer-0 path).
+                #
+                # Step 1 fallback: if extraction fails, use the last typed message
+                #   as plain text (conversational format, no audio tokens).
+                #
+                # Step 0 fallback: if no text either, use the TTS instruction frame.
+                _user_ids = _extract_last_user_ids(inputs["input_ids"], processor.tokenizer)
+
                 _last_user_text = None
-                for _msg in reversed(messages):
-                    if _msg.get("role") == "user":
-                        _content = _msg.get("content", [])
-                        if isinstance(_content, list):
-                            _texts = [c["text"] for c in _content if isinstance(c, dict) and c.get("type") == "text"]
-                            if _texts:
-                                _last_user_text = " ".join(_texts)
-                        elif isinstance(_content, str):
-                            _last_user_text = _content
-                        break
+                if _user_ids is None:
+                    # Extraction failed — fall back to Step 1 (text) or Step 0 (TTS).
+                    for _msg in reversed(messages):
+                        if _msg.get("role") == "user":
+                            _content = _msg.get("content", [])
+                            if isinstance(_content, list):
+                                _texts = [c["text"] for c in _content if isinstance(c, dict) and c.get("type") == "text"]
+                                if _texts:
+                                    _last_user_text = " ".join(_texts)
+                            elif isinstance(_content, str):
+                                _last_user_text = _content
+                            break
 
                 user_embeds, asst_embeds = _build_spliced_embeds(
                     model, processor.tokenizer, reply_ids[0],
                     user_instruction=_DEFAULT_USER_INSTRUCTION,
                     user_text=_last_user_text,
+                    user_ids=_user_ids,
                 )
                 audio_wav = _generate_audio_talker_direct(
                     model,
