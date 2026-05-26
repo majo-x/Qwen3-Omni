@@ -359,6 +359,26 @@ def _launch_demo(args, model, processor):
                 # Original path: integrated model.generate() runs both thinker and
                 # talker together. Audio token positions in the user segment receive
                 # layer24 (thinker hidden states via hidden_projection).
+
+                # --- Debug: show what the thinker receives ---
+                _dbg_ids    = inputs["input_ids"][0]
+                _dbg_ap_id  = processor.tokenizer.convert_tokens_to_ids("<|audio_pad|>")
+                _dbg_im_id  = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
+                _dbg_n_audio = int((_dbg_ids == _dbg_ap_id).sum().item())
+                _dbg_im_pos  = (_dbg_ids == _dbg_im_id).nonzero(as_tuple=True)[0]
+                print(f"[model.generate] input_ids: {tuple(_dbg_ids.shape)}  "
+                      f"audio_pads: {_dbg_n_audio}  turns: {len(_dbg_im_pos)}")
+                # Decode the last user turn (second-to-last <|im_start|> up to the end)
+                if len(_dbg_im_pos) >= 2:
+                    _dbg_u_start = int(_dbg_im_pos[-2].item())
+                    _dbg_u_tokens = _dbg_ids[_dbg_u_start:]
+                    _dbg_u_decoded = processor.tokenizer.decode(
+                        _dbg_u_tokens, skip_special_tokens=False
+                    )
+                    print(f"[model.generate] last user turn "
+                          f"({len(_dbg_u_tokens)} tokens): {_dbg_u_decoded!r}")
+                # -----------------------------------------------
+
                 text_ids, audio = model.generate(
                     **inputs,
                     thinker_return_dict_in_generate=True,
@@ -371,6 +391,7 @@ def _launch_demo(args, model, processor):
                     use_audio_in_video=True,
                 )
                 response = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+                print(f"[model.generate] thinker response: {response!r}")
                 yield {"type": "text", "data": response}
                 if audio is not None:
                     audio = np.array(audio.reshape(-1).float().detach().cpu().numpy() * 32767).astype(np.int16)
